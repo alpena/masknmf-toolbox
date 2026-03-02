@@ -166,3 +166,4 @@ cython_debug/
 *.tif*
 docs/source/_gallery/
 docs/source/sg_execution_times.rst
+*.h5
