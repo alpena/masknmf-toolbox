@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 import torch
+import h5py
 
 import masknmf
 
@@ -16,7 +17,10 @@ class MotionCorrectionConfig:
     input_image_path: str
     out_path: str
     out_tiff_path: str | None = None
+    out_extract_h5_path: str | None = None
     export_tiff_stack: bool = True
+    export_extract_h5: bool = False
+    extract_h5_dtype: str = "uint16"
     num_blocks_dim1: int = 10
     num_blocks_dim2: int = 10
     overlaps_dim1: int = 5
@@ -42,10 +46,27 @@ def parse_args() -> argparse.Namespace:
         help="Path to output TIFF stack. If omitted, uses out_path with .tif suffix.",
     )
     parser.add_argument(
+        "--out_extract_h5_path",
+        default=None,
+        help="Path to EXTRACT-compatible HDF5. If omitted, uses out_path with '_extract.h5' suffix.",
+    )
+    parser.add_argument(
         "--export_tiff_stack",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Whether to also export motion-corrected frames as TIFF stack.",
+    )
+    parser.add_argument(
+        "--export_extract_h5",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to also export an EXTRACT-compatible HDF5 with dataset '/mov'.",
+    )
+    parser.add_argument(
+        "--extract_h5_dtype",
+        default="uint16",
+        choices=["uint16", "float32"],
+        help="Data type for EXTRACT-compatible HDF5 '/mov' dataset.",
     )
     parser.add_argument(
         "--num_blocks_dim1",
@@ -121,7 +142,10 @@ def config_from_args(args: argparse.Namespace) -> MotionCorrectionConfig:
         input_image_path=args.input_image_path,
         out_path=args.out_path,
         out_tiff_path=args.out_tiff_path,
+        out_extract_h5_path=args.out_extract_h5_path,
         export_tiff_stack=args.export_tiff_stack,
+        export_extract_h5=args.export_extract_h5,
+        extract_h5_dtype=args.extract_h5_dtype,
         num_blocks_dim1=args.num_blocks_dim1,
         num_blocks_dim2=args.num_blocks_dim2,
         overlaps_dim1=args.overlaps_dim1,
@@ -184,6 +208,63 @@ def export_tiff_stack(
     return tiff_path
 
 
+def export_extract_compatible_h5(
+    registered_movie: masknmf.RegistrationArray,
+    out_extract_h5_path: str | Path,
+    batch_size: int,
+    dtype: str = "uint16",
+) -> Path:
+    extract_path = Path(out_extract_h5_path).resolve()
+    extract_path.parent.mkdir(parents=True, exist_ok=True)
+    if extract_path.exists():
+        raise FileExistsError(f"EXTRACT HDF5 output already exists: {extract_path}")
+
+    num_frames, fov_h, fov_w = registered_movie.shape
+    print(f"Exporting EXTRACT-compatible HDF5 to: {extract_path}")
+
+    if dtype == "uint16":
+        global_min = np.inf
+        global_max = -np.inf
+        for start in range(0, num_frames, batch_size):
+            end = min(start + batch_size, num_frames)
+            subset = np.asarray(registered_movie[start:end], dtype=np.float32)
+            if not np.all(np.isfinite(subset)):
+                raise ValueError("Non-finite values detected in motion-corrected movie.")
+            global_min = min(global_min, float(np.min(subset)))
+            global_max = max(global_max, float(np.max(subset)))
+
+        scale = 65535.0 / max(global_max - global_min, 1e-8)
+    else:
+        global_min = 0.0
+        scale = 1.0
+
+    with h5py.File(str(extract_path), "w") as f:
+        # NOTE:
+        # For this EXTRACT/MATLAB pipeline, MATLAB h5info reports dimensions
+        # in reverse order of Python h5py shape.
+        # To make MATLAB see /mov as [H, W, T], we save Python shape as [T, W, H].
+        if dtype == "uint16":
+            dset = f.create_dataset("/mov", shape=(num_frames, fov_w, fov_h), dtype=np.uint16)
+        else:
+            dset = f.create_dataset("/mov", shape=(num_frames, fov_w, fov_h), dtype=np.float32)
+
+        for start in range(0, num_frames, batch_size):
+            end = min(start + batch_size, num_frames)
+            subset = np.asarray(registered_movie[start:end], dtype=np.float32)
+            if not np.all(np.isfinite(subset)):
+                raise ValueError("Non-finite values detected in motion-corrected movie.")
+
+            if dtype == "uint16":
+                subset = np.clip((subset - global_min) * scale, 0.0, 65535.0).astype(np.uint16)
+            else:
+                subset = subset.astype(np.float32)
+
+            # subset: (T, H, W) -> write as (T, W, H)
+            dset[start:end, :, :] = np.transpose(subset, (0, 2, 1))
+
+    return extract_path
+
+
 def run_motion_correction(config: MotionCorrectionConfig) -> Path:
     data = load_tiff_movie(config.input_image_path)
 
@@ -233,6 +314,18 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             registered_movie=moco_results,
             out_tiff_path=tiff_out_path,
             batch_size=config.frame_batch_size,
+        )
+    if config.export_extract_h5:
+        extract_out_path = (
+            Path(config.out_extract_h5_path).resolve()
+            if config.out_extract_h5_path is not None
+            else out_path.with_name(f"{out_path.stem}_extract.h5")
+        )
+        export_extract_compatible_h5(
+            registered_movie=moco_results,
+            out_extract_h5_path=extract_out_path,
+            batch_size=config.frame_batch_size,
+            dtype=config.extract_h5_dtype,
         )
     print("Done.")
     return out_path
