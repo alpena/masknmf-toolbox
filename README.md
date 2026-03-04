@@ -122,6 +122,40 @@ pip install ".[dcimg]"
 
 Support for other formats can be easily added by defining a data loader class that implements `LazyFrameLoader`.
 
+### DCIMG quick start
+
+Convert dcimg to toolbox-compatible HDF5 (standard dataset: `motion_corrected`):
+
+```bash
+python dev/dcimg_to_hdf5_sample.py \
+  --input_dcimg_path demo_data/250206-UK6-1-F=4_power=5mW_00001.dcimg \
+  --out_h5_path demo_data/output/250206-UK6-1-F=4_power=5mW_00001_first500.h5 \
+  --max_frames 500
+```
+
+Run piecewise-rigid motion correction directly from dcimg and export standard toolbox HDF5:
+
+```bash
+python dev/1pMCRI_motion_correct_data.py \
+  --input_image_path demo_data/250206-UK6-1-F=4_power=5mW_00001.dcimg \
+  --out_path demo_data/output/250206-UK6-1-F=4_power=5mW_moco.h5 \
+  --input_max_frames 500 \
+  --no-export_tiff_stack
+```
+
+Batch mode (single script, multiple files):
+
+```bash
+python dev/1pMCRI_motion_correct_data.py \
+  --input_dir demo_data \
+  --glob_pattern "*.dcimg" \
+  --output_dir demo_data/output \
+  --out_suffix "_moco" \
+  --input_max_frames 500 \
+  --frame_batch_size 20 \
+  --no-export_tiff_stack
+```
+
 ## Paper
 
 If you use this method, please cite the accompanying [paper](https://www.biorxiv.org/content/10.1101/2023.09.14.557777v1)
