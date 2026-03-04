@@ -2,6 +2,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+import h5py
 import numpy as np
 import tifffile
 import torch
@@ -17,15 +18,17 @@ class MotionCorrectionConfig:
     out_path: str
     out_tiff_path: str | None = None
     export_tiff_stack: bool = True
-    num_blocks_dim1: int = 10
-    num_blocks_dim2: int = 10
-    overlaps_dim1: int = 5
-    overlaps_dim2: int = 5
+    output_dtype: str = "uint16"
+    output_compression: str = "lzf"
+    num_blocks_dim1: int = 20
+    num_blocks_dim2: int = 20
+    overlaps_dim1: int = 25
+    overlaps_dim2: int = 25
     max_rigid_shifts_dim1: int = 15
     max_rigid_shifts_dim2: int = 15
-    max_deviation_rigid_dim1: int = 2
-    max_deviation_rigid_dim2: int = 2
-    frame_batch_size: int = 20
+    max_deviation_rigid_dim1: int = 10
+    max_deviation_rigid_dim2: int = 10
+    frame_batch_size: int = 50
     spatial_highpass_sigma: float = 3.0
     input_max_frames: int | None = None
     dcimg_first_4px_correction: bool = False
@@ -171,27 +174,39 @@ def parse_args() -> argparse.Namespace:
         help="Whether to also export motion-corrected frames as TIFF stack.",
     )
     parser.add_argument(
+        "--output_dtype",
+        default="uint16",
+        choices=["uint16", "float32"],
+        help="Data type of motion_corrected dataset in output HDF5.",
+    )
+    parser.add_argument(
+        "--output_compression",
+        default="lzf",
+        choices=["none", "lzf", "gzip"],
+        help="Compression used when writing HDF5 datasets.",
+    )
+    parser.add_argument(
         "--num_blocks_dim1",
         type=int,
-        default=10,
+        default=20,
         help="Number of blocks along image height for piecewise-rigid registration.",
     )
     parser.add_argument(
         "--num_blocks_dim2",
         type=int,
-        default=10,
+        default=20,
         help="Number of blocks along image width for piecewise-rigid registration.",
     )
     parser.add_argument(
         "--overlaps_dim1",
         type=int,
-        default=5,
+        default=25,
         help="Block overlap size in pixels along image height.",
     )
     parser.add_argument(
         "--overlaps_dim2",
         type=int,
-        default=5,
+        default=25,
         help="Block overlap size in pixels along image width.",
     )
     parser.add_argument(
@@ -209,13 +224,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_deviation_rigid_dim1",
         type=int,
-        default=2,
+        default=10,
         help="Maximum per-block shift deviation from global rigid shift along height.",
     )
     parser.add_argument(
         "--max_deviation_rigid_dim2",
         type=int,
-        default=2,
+        default=10,
         help="Maximum per-block shift deviation from global rigid shift along width.",
     )
     parser.add_argument(
@@ -261,6 +276,8 @@ def config_from_args(args: argparse.Namespace) -> MotionCorrectionConfig:
         out_path=args.out_path,
         out_tiff_path=args.out_tiff_path,
         export_tiff_stack=args.export_tiff_stack,
+        output_dtype=args.output_dtype,
+        output_compression=args.output_compression,
         num_blocks_dim1=args.num_blocks_dim1,
         num_blocks_dim2=args.num_blocks_dim2,
         overlaps_dim1=args.overlaps_dim1,
@@ -285,6 +302,8 @@ def build_config_for_path(
         out_path=str(out_path),
         out_tiff_path=args.out_tiff_path,
         export_tiff_stack=args.export_tiff_stack,
+        output_dtype=args.output_dtype,
+        output_compression=args.output_compression,
         num_blocks_dim1=args.num_blocks_dim1,
         num_blocks_dim2=args.num_blocks_dim2,
         overlaps_dim1=args.overlaps_dim1,
@@ -387,6 +406,74 @@ def export_tiff_stack(
     return tiff_path
 
 
+def export_standard_h5_streaming(
+    registered_movie: masknmf.RegistrationArray,
+    out_path: str | Path,
+    batch_size: int,
+    motion_dtype: str = "uint16",
+    compression: str = "lzf",
+) -> Path:
+    output_path = Path(out_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        raise FileExistsError(f"HDF5 output already exists: {output_path}")
+
+    num_frames, fov_h, fov_w = registered_movie.shape
+    compression_value = None if compression == "none" else compression
+
+    if isinstance(registered_movie.strategy, masknmf.PiecewiseRigidMotionCorrector):
+        shifts_shape = (
+            num_frames,
+            registered_movie.block_centers.shape[0],
+            registered_movie.block_centers.shape[1],
+            2,
+        )
+    elif isinstance(registered_movie.strategy, masknmf.RigidMotionCorrector):
+        shifts_shape = (num_frames, 2)
+    elif isinstance(registered_movie.strategy, masknmf.DummyMotionCorrector):
+        shifts_shape = None
+    else:
+        raise ValueError("Unsupported motion correction strategy")
+
+    motion_np_dtype = np.uint16 if motion_dtype == "uint16" else np.float32
+
+    print(f"Exporting motion-corrected movie to: {output_path}")
+    with h5py.File(str(output_path), "w") as h5f:
+        motion_dset = h5f.create_dataset(
+            "motion_corrected",
+            shape=(num_frames, fov_h, fov_w),
+            dtype=motion_np_dtype,
+            chunks=(min(batch_size, num_frames), fov_h, fov_w),
+            compression=compression_value,
+        )
+        if shifts_shape is not None:
+            shifts_dset = h5f.create_dataset(
+                "shifts",
+                shape=shifts_shape,
+                dtype=np.float32,
+                compression=compression_value,
+            )
+        else:
+            shifts_dset = None
+
+        for start in range(0, num_frames, batch_size):
+            end = min(start + batch_size, num_frames)
+            moco_subset, shifts_subset = registered_movie._index_frames_tensor(slice(start, end))
+            moco_subset = np.asarray(moco_subset, dtype=np.float32)
+
+            if motion_dtype == "uint16":
+                # Keep toolbox dataset format while reducing storage and memory pressure.
+                to_store = np.clip(np.rint(moco_subset), 0, 65535).astype(np.uint16)
+            else:
+                to_store = moco_subset.astype(np.float32)
+
+            motion_dset[start:end, :, :] = to_store
+            if shifts_dset is not None:
+                shifts_dset[start:end, ...] = np.asarray(shifts_subset, dtype=np.float32)
+
+    return output_path
+
+
 def run_motion_correction(config: MotionCorrectionConfig) -> Path:
     data_loader = load_movie_loader(
         config.input_image_path,
@@ -434,8 +521,13 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
 
     out_path = Path(config.out_path).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Exporting motion-corrected movie to: {out_path}")
-    moco_results.export(str(out_path))
+    export_standard_h5_streaming(
+        registered_movie=moco_results,
+        out_path=out_path,
+        batch_size=config.frame_batch_size,
+        motion_dtype=config.output_dtype,
+        compression=config.output_compression,
+    )
     if config.export_tiff_stack:
         tiff_out_path = (
             Path(config.out_tiff_path).resolve()
