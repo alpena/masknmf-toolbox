@@ -50,6 +50,10 @@ dev = [
     "masknmf[docs]",
 ]
 
+dcimg = [
+    "dcimg @ git+https://github.com/lens-biophotonics/dcimg.git@3f1e2eec27a4e414903b0fcd1da711e7f565dcce",
+]
+
 
 
 [project.urls]

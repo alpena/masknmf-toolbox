@@ -101,8 +101,26 @@ See the notebooks folder for demos on how to use the motion correction, compress
 Support currently provided for 
 - multipage .tiff files 
 - hdf5 files. 
+- .dcimg files (via optional `dcimg` dependency)
 
-Support for other formats can be easily added by defining a data loader class that implements LazyDataLoader. 
+For `.dcimg`, use the latest GitHub version of `dcimg`:
+
+```bash
+pip install "git+https://github.com/lens-biophotonics/dcimg.git@3f1e2eec27a4e414903b0fcd1da711e7f565dcce"
+```
+
+Note:
+- In our current tests, `dcimg` failed with `numpy>=2` and worked with `numpy<2`.
+- Registration itself does not require `cvxpy`, but `cvxpy` in this project depends on `numpy>=2`.
+- If this conflict affects your workflow, use a separate environment for dcimg conversion.
+
+or install toolbox extra dependencies:
+
+```bash
+pip install ".[dcimg]"
+```
+
+Support for other formats can be easily added by defining a data loader class that implements `LazyFrameLoader`.
 
 ## Paper
 

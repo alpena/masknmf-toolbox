@@ -4,6 +4,10 @@ import masknmf
 import pytest
 
 
+def test_dcimg_loader_is_exported():
+    assert hasattr(masknmf, "DcimgArray")
+
+
 def test_rigid_motion_gpu():
     x = (np.random.rand(4, 32, 32) * 4096).astype(np.int16)
     rigid = masknmf.RigidMotionCorrector(max_shifts=(3, 3))

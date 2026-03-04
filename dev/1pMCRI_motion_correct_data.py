@@ -31,14 +31,77 @@ class MotionCorrectionConfig:
     max_deviation_rigid_dim2: int = 2
     frame_batch_size: int = 500
     spatial_highpass_sigma: float = 3.0
+    input_max_frames: int | None = None
+    dcimg_first_4px_correction: bool = False
     device: str = "auto"
+
+
+class PrefixFrameLoader(masknmf.LazyFrameLoader):
+    """Temporal prefix view over another frame loader."""
+
+    def __init__(self, base_loader: masknmf.LazyFrameLoader, max_frames: int):
+        if max_frames <= 0:
+            raise ValueError("max_frames must be > 0")
+        self._base_loader = base_loader
+        self._shape = (
+            min(max_frames, base_loader.shape[0]),
+            base_loader.shape[1],
+            base_loader.shape[2],
+        )
+
+    @property
+    def dtype(self):
+        return self._base_loader.dtype
+
+    @property
+    def shape(self):
+        return self._shape
+
+    def _compute_at_indices(self, indices):
+        if isinstance(indices, int):
+            if indices < 0:
+                indices += self.shape[0]
+            if indices < 0 or indices >= self.shape[0]:
+                raise IndexError("Frame index out of range")
+            return self._base_loader[indices]
+        if isinstance(indices, list):
+            if len(indices) == 0:
+                return np.empty((0, self.shape[1], self.shape[2]), dtype=np.float32)
+            normalized = []
+            for index in indices:
+                idx = int(index)
+                if idx < 0:
+                    idx += self.shape[0]
+                if idx < 0 or idx >= self.shape[0]:
+                    raise IndexError("Frame index out of range")
+                normalized.append(idx)
+            frame_list = [np.asarray(self._base_loader[idx]) for idx in normalized]
+            return np.stack(frame_list, axis=0)
+
+        start = indices.start or 0
+        stop = indices.stop or self.shape[0]
+        step = indices.step or 1
+        if step == 0:
+            raise ValueError("slice step cannot be zero")
+        if step > 0 and start >= stop:
+            return np.empty((0, self.shape[1], self.shape[2]), dtype=np.float32)
+        if step < 0 and start <= stop:
+            return np.empty((0, self.shape[1], self.shape[2]), dtype=np.float32)
+        data = self._base_loader[slice(start, stop, step)]
+        if data.ndim == 2:
+            data = data[None, :, :]
+        return np.asarray(data)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run piecewise-rigid motion correction for 1p imaging from a TIFF path."
+        description="Run piecewise-rigid motion correction for 1p imaging from a TIFF or DCIMG path."
     )
-    parser.add_argument("--input_image_path", required=True, help="Path to input TIFF movie.")
+    parser.add_argument(
+        "--input_image_path",
+        required=True,
+        help="Path to input movie (.tif/.tiff/.dcimg).",
+    )
     parser.add_argument("--out_path", required=True, help="Path to output HDF5 file.")
     parser.add_argument(
         "--out_tiff_path",
@@ -129,6 +192,18 @@ def parse_args() -> argparse.Namespace:
         help="Sigma for spatial high-pass filter used for shift estimation only. Set <=0 to disable.",
     )
     parser.add_argument(
+        "--input_max_frames",
+        type=int,
+        default=None,
+        help="If set, restrict processing to first N frames (useful for dry runs).",
+    )
+    parser.add_argument(
+        "--dcimg_first_4px_correction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to enable first_4px_correction when reading .dcimg.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         choices=["auto", "cpu", "cuda"],
@@ -156,22 +231,33 @@ def config_from_args(args: argparse.Namespace) -> MotionCorrectionConfig:
         max_deviation_rigid_dim2=args.max_deviation_rigid_dim2,
         frame_batch_size=args.frame_batch_size,
         spatial_highpass_sigma=args.spatial_highpass_sigma,
+        input_max_frames=args.input_max_frames,
+        dcimg_first_4px_correction=args.dcimg_first_4px_correction,
         device=args.device,
     )
 
 
-def load_tiff_movie(input_image_path: str | Path) -> np.ndarray:
+def load_movie_loader(
+    input_image_path: str | Path,
+    dcimg_first_4px_correction: bool = False,
+) -> masknmf.LazyFrameLoader:
     path = Path(input_image_path)
     if not path.exists():
         raise FileNotFoundError(f"Input image not found: {path}")
 
-    movie = tifffile.imread(path)
-    if movie.ndim == 2:
-        movie = movie[None, :, :]
-    if movie.ndim != 3:
-        raise ValueError(f"Expected a 2D/3D TIFF movie, got shape {movie.shape}")
+    suffix = path.suffix.lower()
+    if suffix in {".tif", ".tiff"}:
+        return masknmf.TiffArray(str(path))
+    if suffix == ".dcimg":
+        return masknmf.DcimgArray(
+            filename=str(path),
+            first_4px_correction=dcimg_first_4px_correction,
+        )
 
-    return np.asarray(movie)
+    raise ValueError(
+        f"Unsupported input format: {path.suffix}. "
+        "Expected .tif/.tiff/.dcimg."
+    )
 
 
 def build_highpass_filter(sigma: float, device: str):
@@ -266,7 +352,14 @@ def export_extract_compatible_h5(
 
 
 def run_motion_correction(config: MotionCorrectionConfig) -> Path:
-    data = load_tiff_movie(config.input_image_path)
+    data_loader = load_movie_loader(
+        config.input_image_path,
+        dcimg_first_4px_correction=config.dcimg_first_4px_correction,
+    )
+    if config.input_max_frames is not None:
+        if config.input_max_frames <= 0:
+            raise ValueError("input_max_frames must be > 0")
+        data_loader = PrefixFrameLoader(data_loader, max_frames=config.input_max_frames)
 
     pwrigid_strategy = masknmf.PiecewiseRigidMotionCorrector(
         num_blocks=(config.num_blocks_dim1, config.num_blocks_dim2),
@@ -277,14 +370,14 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
         device=config.device,
     )
 
-    print(f"Input movie shape: {data.shape}")
+    print(f"Input movie shape: {data_loader.shape}")
     print(f"Motion correction device: {pwrigid_strategy.device}")
 
     if config.spatial_highpass_sigma > 0:
         print(f"Using spatial high-pass for shift estimation (sigma={config.spatial_highpass_sigma})")
         filter_fn = build_highpass_filter(config.spatial_highpass_sigma, pwrigid_strategy.device)
         filtered_reference = masknmf.FilteredArray(
-            raw_data_loader=data,
+            raw_data_loader=data_loader,
             filter_function=filter_fn,
             batching=config.frame_batch_size,
             device=pwrigid_strategy.device,
@@ -293,12 +386,15 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
         moco_results = masknmf.RegistrationArray(
             reference_movie=filtered_reference,
             strategy=pwrigid_strategy,
-            target_movie=data,
+            target_movie=data_loader,
         )
     else:
         print("Spatial high-pass disabled.")
-        pwrigid_strategy.compute_template(data)
-        moco_results = masknmf.RegistrationArray(reference_movie=data, strategy=pwrigid_strategy)
+        pwrigid_strategy.compute_template(data_loader)
+        moco_results = masknmf.RegistrationArray(
+            reference_movie=data_loader,
+            strategy=pwrigid_strategy,
+        )
 
     out_path = Path(config.out_path).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
