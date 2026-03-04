@@ -9,6 +9,8 @@ Run:
 """
 
 import importlib.util
+import os
+import shutil
 from pathlib import Path
 
 
@@ -22,18 +24,45 @@ def load_1pmcri_module():
     return module
 
 
+def pick_fast_output_root() -> Path:
+    """
+    Pick fast local drive when available.
+    - Windows: E:\
+    - Linux/Ubuntu: /mnt/nvme
+    Fallback: demo_data/output
+    """
+    if os.name == "nt":
+        win_fast = Path("E:/")
+        if win_fast.exists():
+            return win_fast / "masknmf-output"
+    else:
+        linux_fast = Path("/mnt/nvme")
+        if linux_fast.exists():
+            return linux_fast / "masknmf-output"
+    return Path("demo_data/output").resolve()
+
+
 def main() -> None:
     module = load_1pmcri_module()
 
     input_path = Path("demo_data/250810-Ras2-GC#78.dcimg").resolve()
-    output_path = Path("demo_data/output/250810-Ras2-GC#78_moco_uint16.h5").resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_root = pick_fast_output_root()
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_path = (output_root / "250810-Ras2-GC#78_moco_uint16.h5").resolve()
+    final_output_dir = Path("demo_data/output").resolve()
+    final_output_dir.mkdir(parents=True, exist_ok=True)
+    final_output_path = (final_output_dir / output_path.name).resolve()
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
     if output_path.exists():
         raise FileExistsError(
             f"Output already exists: {output_path}. "
+            "Rename/remove it before running."
+        )
+    if final_output_path.exists():
+        raise FileExistsError(
+            f"Final output already exists: {final_output_path}. "
             "Rename/remove it before running."
         )
 
@@ -51,10 +80,14 @@ def main() -> None:
 
     print("Running 1pMCRI real-data script")
     print(f"  input : {input_path}")
-    print(f"  output: {output_path}")
+    print(f"  temp output : {output_path}")
+    print(f"  final output: {final_output_path}")
     print("  settings: full frames, batch_size=50, output_dtype=uint16, compression=none, no TIFF")
 
     module.run_motion_correction(config)
+    if output_path != final_output_path:
+        print(f"Moving output to final location: {final_output_path}")
+        shutil.move(str(output_path), str(final_output_path))
     print("Real-data run completed successfully.")
 
 

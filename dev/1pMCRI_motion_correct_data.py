@@ -6,6 +6,7 @@ import h5py
 import numpy as np
 import tifffile
 import torch
+from tqdm import tqdm
 
 import masknmf
 
@@ -389,6 +390,7 @@ def export_tiff_stack(
     registered_movie: masknmf.RegistrationArray,
     out_tiff_path: str | Path,
     batch_size: int,
+    output_dtype: str = "uint16",
 ) -> Path:
     tiff_path = Path(out_tiff_path).resolve()
     tiff_path.parent.mkdir(parents=True, exist_ok=True)
@@ -401,6 +403,10 @@ def export_tiff_stack(
         for start in range(0, num_frames, batch_size):
             end = min(start + batch_size, num_frames)
             subset = np.asarray(registered_movie[start:end], dtype=np.float32)
+            if output_dtype == "uint16":
+                subset = np.clip(np.rint(subset), 0, 65535).astype(np.uint16)
+            else:
+                subset = subset.astype(np.float32)
             tif.write(subset, contiguous=True)
 
     return tiff_path
@@ -456,7 +462,8 @@ def export_standard_h5_streaming(
         else:
             shifts_dset = None
 
-        for start in range(0, num_frames, batch_size):
+        starts = list(range(0, num_frames, batch_size))
+        for start in tqdm(starts, desc="Exporting H5 batches", unit="batch"):
             end = min(start + batch_size, num_frames)
             moco_subset, shifts_subset = registered_movie._index_frames_tensor(slice(start, end))
             moco_subset = np.asarray(moco_subset, dtype=np.float32)
@@ -538,6 +545,7 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             registered_movie=moco_results,
             out_tiff_path=tiff_out_path,
             batch_size=config.frame_batch_size,
+            output_dtype=config.output_dtype,
         )
     print("Done.")
     return out_path
