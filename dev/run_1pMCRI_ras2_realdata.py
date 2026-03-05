@@ -48,10 +48,12 @@ def main() -> None:
     input_path = Path("demo_data/250810-Ras2-GC#78.dcimg").resolve()
     output_root = pick_fast_output_root()
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = (output_root / "250810-Ras2-GC#78_moco_uint16.h5").resolve()
+    output_path = (output_root / "250810-Ras2-GC#78_moco_first100_smoke.h5").resolve()
     final_output_dir = Path("demo_data/output").resolve()
     final_output_dir.mkdir(parents=True, exist_ok=True)
     final_output_path = (final_output_dir / output_path.name).resolve()
+    temp_tiff_path = output_path.with_suffix(".tif")
+    final_tiff_path = final_output_path.with_suffix(".tif")
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -65,13 +67,23 @@ def main() -> None:
             f"Final output already exists: {final_output_path}. "
             "Rename/remove it before running."
         )
+    if temp_tiff_path.exists():
+        raise FileExistsError(
+            f"Temp TIFF already exists: {temp_tiff_path}. "
+            "Rename/remove it before running."
+        )
+    if final_tiff_path.exists():
+        raise FileExistsError(
+            f"Final TIFF already exists: {final_tiff_path}. "
+            "Rename/remove it before running."
+        )
 
     config = module.MotionCorrectionConfig(
         input_image_path=str(input_path),
         out_path=str(output_path),
-        export_tiff_stack=False,
+        export_tiff_stack=True,
         # Real-data run: process all frames
-        input_max_frames=None,
+        input_max_frames=100,
         frame_batch_size=50,
         output_dtype="uint16",
         output_compression="none",
@@ -88,6 +100,9 @@ def main() -> None:
     if output_path != final_output_path:
         print(f"Moving output to final location: {final_output_path}")
         shutil.move(str(output_path), str(final_output_path))
+    if config.export_tiff_stack and temp_tiff_path.exists() and temp_tiff_path != final_tiff_path:
+        print(f"Moving TIFF to final location: {final_tiff_path}")
+        shutil.move(str(temp_tiff_path), str(final_tiff_path))
     print("Real-data run completed successfully.")
 
 
