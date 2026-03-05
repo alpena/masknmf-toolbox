@@ -45,10 +45,14 @@ def pick_fast_output_root() -> Path:
 def main() -> None:
     module = load_1pmcri_module()
 
+    # User options
+    export_extract_optimized_h5 = True  # True: write '/mov' directly, False: legacy '/motion_corrected'
+    extract_orientation_fix = "transpose_xy"  # 'transpose_xy' or 'none'
+
     input_path = Path("demo_data/250810-Ras2-GC#78.dcimg").resolve()
     output_root = pick_fast_output_root()
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = (output_root / "250810-Ras2-GC#78_moco_first2000_smoke.h5").resolve()
+    output_path = (output_root / "250810-Ras2-GC#78_moco_first100_smoke_direct.h5").resolve()
     final_output_dir = Path("demo_data/output").resolve()
     final_output_dir.mkdir(parents=True, exist_ok=True)
     final_output_path = (final_output_dir / output_path.name).resolve()
@@ -83,10 +87,15 @@ def main() -> None:
         out_path=str(output_path),
         export_tiff_stack=False,
         # Real-data run: process all frames
-        input_max_frames=2000,
+        input_max_frames=100,
         frame_batch_size=50,
         output_dtype="uint16",
-        output_compression="lzf",
+        output_compression="none",
+        export_extract_optimized_h5=export_extract_optimized_h5,
+        extract_orientation_fix=extract_orientation_fix,
+        extract_chunk_t=256,
+        extract_chunk_x=256,
+        extract_chunk_y=256,
         device="auto",
     )
 
@@ -96,13 +105,16 @@ def main() -> None:
     print(f"  final output: {final_output_path}")
     frames_text = "full frames" if config.input_max_frames is None else f"first {config.input_max_frames} frames"
     tiff_text = "TIFF export" if config.export_tiff_stack else "no TIFF"
+    output_mode = "direct-extract (/mov)" if config.export_extract_optimized_h5 else "legacy (/motion_corrected)"
     print(
         "  settings: "
         f"{frames_text}, "
         f"batch_size={config.frame_batch_size}, "
         f"output_dtype={config.output_dtype}, "
         f"compression={config.output_compression}, "
-        f"{tiff_text}"
+        f"{tiff_text}, "
+        f"output_mode={output_mode}, "
+        f"extract_orientation_fix={config.extract_orientation_fix}"
     )
 
     module.run_motion_correction(config)

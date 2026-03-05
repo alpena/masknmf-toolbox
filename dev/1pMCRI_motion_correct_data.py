@@ -20,7 +20,12 @@ class MotionCorrectionConfig:
     out_tiff_path: str | None = None
     export_tiff_stack: bool = True
     output_dtype: str = "uint16"
-    output_compression: str = "lzf"
+    output_compression: str = "none"
+    export_extract_optimized_h5: bool = False
+    extract_orientation_fix: str = "transpose_xy"
+    extract_chunk_t: int = 256
+    extract_chunk_x: int = 256
+    extract_chunk_y: int = 256
     num_blocks_dim1: int = 20
     num_blocks_dim2: int = 20
     overlaps_dim1: int = 25
@@ -178,13 +183,43 @@ def parse_args() -> argparse.Namespace:
         "--output_dtype",
         default="uint16",
         choices=["uint16", "float32"],
-        help="Data type of motion_corrected dataset in output HDF5.",
+        help="Data type of movie dataset in output HDF5 (/motion_corrected or /mov).",
     )
     parser.add_argument(
         "--output_compression",
-        default="lzf",
+        default="none",
         choices=["none", "lzf", "gzip"],
         help="Compression used when writing HDF5 datasets.",
+    )
+    parser.add_argument(
+        "--export_extract_optimized_h5",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write EXTRACT-ready dataset '/mov' directly instead of '/motion_corrected'.",
+    )
+    parser.add_argument(
+        "--extract_orientation_fix",
+        default="transpose_xy",
+        choices=["none", "transpose_xy"],
+        help="Orientation fix used when writing EXTRACT-ready H5.",
+    )
+    parser.add_argument(
+        "--extract_chunk_t",
+        type=int,
+        default=256,
+        help="Chunk size in t for direct EXTRACT H5 export.",
+    )
+    parser.add_argument(
+        "--extract_chunk_x",
+        type=int,
+        default=256,
+        help="Chunk size in x (stored axis-2) for direct EXTRACT H5 export.",
+    )
+    parser.add_argument(
+        "--extract_chunk_y",
+        type=int,
+        default=256,
+        help="Chunk size in y (stored axis-3) for direct EXTRACT H5 export.",
     )
     parser.add_argument(
         "--num_blocks_dim1",
@@ -279,6 +314,11 @@ def config_from_args(args: argparse.Namespace) -> MotionCorrectionConfig:
         export_tiff_stack=args.export_tiff_stack,
         output_dtype=args.output_dtype,
         output_compression=args.output_compression,
+        export_extract_optimized_h5=args.export_extract_optimized_h5,
+        extract_orientation_fix=args.extract_orientation_fix,
+        extract_chunk_t=args.extract_chunk_t,
+        extract_chunk_x=args.extract_chunk_x,
+        extract_chunk_y=args.extract_chunk_y,
         num_blocks_dim1=args.num_blocks_dim1,
         num_blocks_dim2=args.num_blocks_dim2,
         overlaps_dim1=args.overlaps_dim1,
@@ -305,6 +345,11 @@ def build_config_for_path(
         export_tiff_stack=args.export_tiff_stack,
         output_dtype=args.output_dtype,
         output_compression=args.output_compression,
+        export_extract_optimized_h5=args.export_extract_optimized_h5,
+        extract_orientation_fix=args.extract_orientation_fix,
+        extract_chunk_t=args.extract_chunk_t,
+        extract_chunk_x=args.extract_chunk_x,
+        extract_chunk_y=args.extract_chunk_y,
         num_blocks_dim1=args.num_blocks_dim1,
         num_blocks_dim2=args.num_blocks_dim2,
         overlaps_dim1=args.overlaps_dim1,
@@ -481,6 +526,125 @@ def export_standard_h5_streaming(
     return output_path
 
 
+def export_extract_h5_streaming(
+    registered_movie: masknmf.RegistrationArray,
+    out_path: str | Path,
+    batch_size: int,
+    motion_dtype: str = "uint16",
+    compression: str = "lzf",
+    orientation_fix: str = "transpose_xy",
+    chunk_t: int = 256,
+    chunk_x: int = 256,
+    chunk_y: int = 256,
+) -> Path:
+    output_path = Path(out_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        raise FileExistsError(f"HDF5 output already exists: {output_path}")
+    if orientation_fix not in {"none", "transpose_xy"}:
+        raise ValueError(
+            f"Unsupported extract_orientation_fix: {orientation_fix}. "
+            "Use 'none' or 'transpose_xy'."
+        )
+
+    num_frames, fov_h, fov_w = registered_movie.shape
+    compression_value = None if compression == "none" else compression
+
+    # Keep shifts layout unchanged from legacy exporter.
+    if isinstance(registered_movie.strategy, masknmf.PiecewiseRigidMotionCorrector):
+        shifts_shape = (
+            num_frames,
+            registered_movie.block_centers.shape[0],
+            registered_movie.block_centers.shape[1],
+            2,
+        )
+    elif isinstance(registered_movie.strategy, masknmf.RigidMotionCorrector):
+        shifts_shape = (num_frames, 2)
+    elif isinstance(registered_movie.strategy, masknmf.DummyMotionCorrector):
+        shifts_shape = None
+    else:
+        raise ValueError("Unsupported motion correction strategy")
+
+    motion_np_dtype = np.uint16 if motion_dtype == "uint16" else np.float32
+
+    if orientation_fix == "none":
+        # Stored shape (t,h,w) -> MATLAB view (w,h,t)
+        out_shape = (num_frames, fov_h, fov_w)
+        matlab_view = (fov_w, fov_h, num_frames)
+    else:
+        # Stored shape (t,w,h) -> MATLAB view (h,w,t)
+        out_shape = (num_frames, fov_w, fov_h)
+        matlab_view = (fov_h, fov_w, num_frames)
+
+    chunk_t_eff = max(1, min(int(chunk_t), num_frames))
+    chunk_x_eff = max(1, min(int(chunk_x), out_shape[1]))
+    chunk_y_eff = max(1, min(int(chunk_y), out_shape[2]))
+
+    bytes_per_voxel = np.dtype(motion_np_dtype).itemsize
+    max_chunk_bytes = 4 * 1024**3 - 1
+    chunk_bytes = chunk_t_eff * chunk_x_eff * chunk_y_eff * bytes_per_voxel
+    while chunk_bytes > max_chunk_bytes and chunk_t_eff > 1:
+        chunk_t_eff = max(1, chunk_t_eff // 2)
+        chunk_bytes = chunk_t_eff * chunk_x_eff * chunk_y_eff * bytes_per_voxel
+    while chunk_bytes > max_chunk_bytes and (chunk_x_eff > 1 or chunk_y_eff > 1):
+        if chunk_x_eff >= chunk_y_eff and chunk_x_eff > 1:
+            chunk_x_eff = max(1, chunk_x_eff // 2)
+        elif chunk_y_eff > 1:
+            chunk_y_eff = max(1, chunk_y_eff // 2)
+        chunk_bytes = chunk_t_eff * chunk_x_eff * chunk_y_eff * bytes_per_voxel
+
+    print(f"Exporting EXTRACT-optimized movie to: {output_path}")
+    print(f"  dataset: /mov")
+    print(f"  orientation_fix: {orientation_fix}")
+    print(
+        f"  stored shape (t,x,y): ({out_shape[0]}, {out_shape[1]}, {out_shape[2]}) "
+        f"| MATLAB view (h,w,t): {matlab_view}"
+    )
+    print(
+        f"  chunks (t,x,y): ({chunk_t_eff}, {chunk_x_eff}, {chunk_y_eff}) "
+        f"[{chunk_bytes / (1024**2):.1f} MiB]"
+    )
+
+    with h5py.File(str(output_path), "w") as h5f:
+        mov_dset = h5f.create_dataset(
+            "mov",
+            shape=out_shape,
+            dtype=motion_np_dtype,
+            chunks=(chunk_t_eff, chunk_x_eff, chunk_y_eff),
+            compression=compression_value,
+        )
+        if shifts_shape is not None:
+            shifts_dset = h5f.create_dataset(
+                "shifts",
+                shape=shifts_shape,
+                dtype=np.float32,
+                compression=compression_value,
+            )
+        else:
+            shifts_dset = None
+
+        starts = list(range(0, num_frames, batch_size))
+        for start in tqdm(starts, desc="Exporting EXTRACT H5 batches", unit="batch"):
+            end = min(start + batch_size, num_frames)
+            moco_subset, shifts_subset = registered_movie._index_frames_tensor(slice(start, end))
+            moco_subset = np.asarray(moco_subset, dtype=np.float32)
+
+            if motion_dtype == "uint16":
+                to_store = np.clip(np.rint(moco_subset), 0, 65535).astype(np.uint16)
+            else:
+                to_store = moco_subset.astype(np.float32)
+
+            if orientation_fix == "transpose_xy":
+                mov_dset[start:end, :, :] = to_store.transpose(0, 2, 1)
+            else:
+                mov_dset[start:end, :, :] = to_store
+
+            if shifts_dset is not None:
+                shifts_dset[start:end, ...] = np.asarray(shifts_subset, dtype=np.float32)
+
+    return output_path
+
+
 def run_motion_correction(config: MotionCorrectionConfig) -> Path:
     data_loader = load_movie_loader(
         config.input_image_path,
@@ -528,13 +692,26 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
 
     out_path = Path(config.out_path).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    export_standard_h5_streaming(
-        registered_movie=moco_results,
-        out_path=out_path,
-        batch_size=config.frame_batch_size,
-        motion_dtype=config.output_dtype,
-        compression=config.output_compression,
-    )
+    if config.export_extract_optimized_h5:
+        export_extract_h5_streaming(
+            registered_movie=moco_results,
+            out_path=out_path,
+            batch_size=config.frame_batch_size,
+            motion_dtype=config.output_dtype,
+            compression=config.output_compression,
+            orientation_fix=config.extract_orientation_fix,
+            chunk_t=config.extract_chunk_t,
+            chunk_x=config.extract_chunk_x,
+            chunk_y=config.extract_chunk_y,
+        )
+    else:
+        export_standard_h5_streaming(
+            registered_movie=moco_results,
+            out_path=out_path,
+            batch_size=config.frame_batch_size,
+            motion_dtype=config.output_dtype,
+            compression=config.output_compression,
+        )
     if config.export_tiff_stack:
         tiff_out_path = (
             Path(config.out_tiff_path).resolve()
