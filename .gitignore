@@ -167,3 +167,4 @@ cython_debug/
 docs/source/_gallery/
 docs/source/sg_execution_times.rst
 *.h5
+demo_data
