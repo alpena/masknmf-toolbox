@@ -646,6 +646,20 @@ def export_extract_h5_streaming(
 
 
 def run_motion_correction(config: MotionCorrectionConfig) -> Path:
+    out_path = Path(config.out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        raise FileExistsError(f"HDF5 output already exists: {out_path}")
+
+    if config.export_tiff_stack:
+        tiff_out_path = (
+            Path(config.out_tiff_path).resolve()
+            if config.out_tiff_path is not None
+            else out_path.with_suffix(".tif")
+        )
+        if tiff_out_path.exists():
+            raise FileExistsError(f"TIFF output already exists: {tiff_out_path}")
+
     data_loader = load_movie_loader(
         config.input_image_path,
         dcimg_first_4px_correction=config.dcimg_first_4px_correction,
@@ -690,8 +704,6 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             strategy=pwrigid_strategy,
         )
 
-    out_path = Path(config.out_path).resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     if config.export_extract_optimized_h5:
         export_extract_h5_streaming(
             registered_movie=moco_results,
@@ -713,11 +725,6 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             compression=config.output_compression,
         )
     if config.export_tiff_stack:
-        tiff_out_path = (
-            Path(config.out_tiff_path).resolve()
-            if config.out_tiff_path is not None
-            else out_path.with_suffix(".tif")
-        )
         export_tiff_stack(
             registered_movie=moco_results,
             out_tiff_path=tiff_out_path,
