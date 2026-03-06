@@ -52,7 +52,7 @@ def main() -> None:
     input_path = Path("demo_data/250810-Ras2-GC#78.dcimg").resolve()
     output_root = pick_fast_output_root()
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = (output_root / "250810-Ras2-GC#78_moco_first500_smoke_direct.h5").resolve()
+    output_path = (output_root / "250810-Ras2-GC#78_moco_direct.h5").resolve()
     final_output_dir = Path("demo_data/output").resolve()
     final_output_dir.mkdir(parents=True, exist_ok=True)
     final_output_path = (final_output_dir / output_path.name).resolve()
@@ -87,7 +87,7 @@ def main() -> None:
         out_path=str(output_path),
         export_tiff_stack=False,
         # Real-data run: process all frames
-        input_max_frames=500,
+        input_max_frames=None,
         frame_batch_size=32,
         output_dtype="uint16",
         output_compression="none",
