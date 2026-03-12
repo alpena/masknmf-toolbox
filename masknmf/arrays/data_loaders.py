@@ -201,39 +201,46 @@ class DcimgArray(LazyFrameLoader):
         """
         return len(self.shape)
 
-    def _compute_at_indices(self, indices: Union[list, int, slice]) -> np.ndarray:
-        def normalize_single_index(index: int) -> int:
-            norm = int(index)
-            if norm < 0:
-                norm += self.shape[0]
-            if norm < 0 or norm >= self.shape[0]:
-                raise IndexError(
-                    f"Frame index {index} is out of range for movie with "
-                    f"{self.shape[0]} frames."
-                )
-            return norm
+    def _normalize_single_index(self, index: int) -> int:
+        norm = int(index)
+        if norm < 0:
+            norm += self.shape[0]
+        if norm < 0 or norm >= self.shape[0]:
+            raise IndexError(
+                f"Frame index {index} is out of range for movie with "
+                f"{self.shape[0]} frames."
+            )
+        return norm
 
-        with self._open_dcimg() as dcimg_file:
-            if isinstance(indices, int):
-                data = np.asarray(dcimg_file[normalize_single_index(indices)])
-            elif isinstance(indices, list):
-                if len(indices) == 0:
-                    return np.empty((0, self.shape[1], self.shape[2]), dtype=self.dtype)
-                indices_normalized = [normalize_single_index(i) for i in indices]
-                frame_list = [np.asarray(dcimg_file[i]) for i in indices_normalized]
-                data = np.stack(frame_list, axis=0)
-            else:
-                start = indices.start or 0
-                stop = indices.stop or self.shape[0]
-                step = indices.step or 1
-                if step == 0:
-                    raise ValueError("slice step cannot be zero")
-                if step > 0 and start >= stop:
-                    return np.empty((0, self.shape[1], self.shape[2]), dtype=self.dtype)
-                if step < 0 and start <= stop:
-                    return np.empty((0, self.shape[1], self.shape[2]), dtype=self.dtype)
-                data = np.asarray(dcimg_file[start:stop:step])
+    def _read_from_handle(
+        self,
+        dcimg_file,
+        indices: Union[list, int, slice],
+    ) -> np.ndarray:
+        if isinstance(indices, int):
+            data = np.asarray(dcimg_file[self._normalize_single_index(indices)])
+        elif isinstance(indices, list):
+            if len(indices) == 0:
+                return np.empty((0, self.shape[1], self.shape[2]), dtype=self.dtype)
+            indices_normalized = [self._normalize_single_index(i) for i in indices]
+            frame_list = [np.asarray(dcimg_file[i]) for i in indices_normalized]
+            data = np.stack(frame_list, axis=0)
+        else:
+            start = indices.start or 0
+            stop = indices.stop or self.shape[0]
+            step = indices.step or 1
+            if step == 0:
+                raise ValueError("slice step cannot be zero")
+            if step > 0 and start >= stop:
+                return np.empty((0, self.shape[1], self.shape[2]), dtype=self.dtype)
+            if step < 0 and start <= stop:
+                return np.empty((0, self.shape[1], self.shape[2]), dtype=self.dtype)
+            data = np.asarray(dcimg_file[start:stop:step])
 
         if data.ndim == 2:
             data = data[None, :, :]
         return data.astype(self.dtype, copy=False)
+
+    def _compute_at_indices(self, indices: Union[list, int, slice]) -> np.ndarray:
+        with self._open_dcimg() as dcimg_file:
+            return self._read_from_handle(dcimg_file, indices)

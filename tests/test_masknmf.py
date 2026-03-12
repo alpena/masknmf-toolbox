@@ -3,6 +3,7 @@ import torch
 import masknmf
 import pytest
 import importlib.util
+import h5py
 from pathlib import Path
 
 
@@ -59,3 +60,33 @@ def test_rigid_motion_cpu():
     rigid.compute_template(x)
     out = masknmf.RegistrationArray(x, rigid)[:]
     assert out.shape == x.shape
+
+
+def test_async_extract_export_with_dummy_strategy(tmp_path):
+    module = _load_1pmcri_module()
+
+    movie = np.arange(4 * 3 * 5, dtype=np.float32).reshape(4, 3, 5)
+    out_path = tmp_path / "dummy_extract_async.h5"
+
+    module.export_extract_h5_streaming_async(
+        data_loader=movie,
+        strategy=masknmf.DummyMotionCorrector(),
+        out_path=out_path,
+        batch_size=2,
+        motion_dtype="float32",
+        compression="none",
+        orientation_fix="none",
+        chunk_t=2,
+        chunk_x=0,
+        chunk_y=0,
+        filter_function=None,
+        prefetch_batches=2,
+        writer_queue_batches=2,
+        pin_memory=False,
+    )
+
+    with h5py.File(out_path, "r") as h5f:
+        np.testing.assert_allclose(h5f["/mov"][...], movie)
+        expected_mean = movie.mean(axis=0).astype(np.float32)
+        np.testing.assert_allclose(h5f["/F_per_pixel"][...], expected_mean)
+        assert "/shifts" not in h5f

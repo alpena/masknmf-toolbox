@@ -91,6 +91,16 @@ class MotionCorrectionStrategy:
         """
         raise NotImplementedError
 
+    def _correct_singlebatch_tensors(
+            self,
+            reference_frames: torch.Tensor,
+            target_frames: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Tensor variant of `_correct_singlebatch` for paths that already manage device transfers.
+        """
+        raise NotImplementedError
+
     def correct(
             self,
             reference_movie_frames: np.ndarray,
@@ -140,6 +150,46 @@ class MotionCorrectionStrategy:
 
         moco_output = np.concatenate(registered_frame_outputs, axis=0)
         shift_output = np.concatenate(frame_shift_outputs, axis=0)
+        return moco_output, shift_output
+
+    def correct_tensors(
+            self,
+            reference_movie_frames: torch.Tensor,
+            target_movie_frames: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        if reference_movie_frames.ndim == 2:
+            reference_movie_frames = reference_movie_frames[None, ...]
+            if target_movie_frames is not None:
+                target_movie_frames = target_movie_frames[None, ...]
+
+        num_iters = math.ceil(reference_movie_frames.shape[0] / self.batch_size)
+        registered_frame_outputs: list[torch.Tensor] = []
+        frame_shift_outputs: list[torch.Tensor] = []
+
+        for k in range(num_iters):
+            start = k * self.batch_size
+            end = min(start + self.batch_size, reference_movie_frames.shape[0])
+            reference_subset = reference_movie_frames[start:end]
+            if target_movie_frames is not None:
+                target_subset = target_movie_frames[start:end]
+            else:
+                target_subset = None
+
+            if reference_subset.ndim == 2:
+                reference_subset = reference_subset[None, :, :]
+            if target_subset is not None and target_subset.ndim == 2:
+                target_subset = target_subset[None, :, :]
+
+            reg_output = self._correct_singlebatch_tensors(
+                reference_frames=reference_subset,
+                target_frames=target_subset,
+            )
+            registered_frame_outputs.append(reg_output[0])
+            frame_shift_outputs.append(reg_output[1])
+
+        moco_output = torch.concatenate(registered_frame_outputs, dim=0)
+        shift_output = torch.concatenate(frame_shift_outputs, dim=0)
         return moco_output, shift_output
 
     def compute_template(
@@ -233,6 +283,15 @@ class DummyMotionCorrector(MotionCorrectionStrategy):
                          ):
         self._template = None
 
+    def _correct_singlebatch_tensors(
+            self,
+            reference_frames: torch.Tensor,
+            target_frames: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if target_frames is not None:
+            return target_frames, torch.zeros((target_frames.shape[0], 2), device=target_frames.device)
+        return reference_frames, torch.zeros((reference_frames.shape[0], 2), device=reference_frames.device)
+
 
 class RigidMotionCorrector(MotionCorrectionStrategy, Serializer):
 
@@ -281,29 +340,40 @@ class RigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             target_frames: Optional[np.ndarray] | None,
     ) -> tuple[np.ndarray, np.ndarray]:
 
+        outputs = self._correct_singlebatch_tensors(
+            reference_frames=torch.from_numpy(reference_frames),
+            target_frames=None if target_frames is None else torch.from_numpy(target_frames),
+        )
+        return outputs[0].cpu().numpy(), outputs[1].cpu().numpy()
+
+    def _correct_singlebatch_tensors(
+            self,
+            reference_frames: torch.Tensor,
+            target_frames: Optional[torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
         if self.template is None:
             raise ValueError(
                 "Template is uninitialized"
             )
 
-        #Move appropriate data to cuda
+        non_blocking = self.device.startswith("cuda")
         if target_frames is not None:
-            target_frames = torch.from_numpy(target_frames).to(self.device).float()
-        reference_frames = torch.from_numpy(reference_frames).to(self.device).float()
-        template = torch.from_numpy(self.template).to(self.device).float()
+            target_frames = target_frames.to(self.device, dtype=torch.float32, non_blocking=non_blocking)
+        reference_frames = reference_frames.to(self.device, dtype=torch.float32, non_blocking=non_blocking)
+        template = torch.as_tensor(self.template, device=self.device, dtype=torch.float32)
         if self.pixel_weighting is not None:
-            pixel_weighting = torch.from_numpy(self.pixel_weighting).to(self.device).float()
+            pixel_weighting = torch.as_tensor(self.pixel_weighting, device=self.device, dtype=torch.float32)
         else:
             pixel_weighting = None
 
-        outputs = register_frames_rigid(
+        return register_frames_rigid(
             reference_frames,
             template,
             self.max_shifts,
             target_frames=target_frames,
             pixel_weighting=pixel_weighting
         )
-        return outputs[0].cpu().numpy(), outputs[1].cpu().numpy()
 
 
 class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
@@ -397,24 +467,36 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             target_frames: Optional[np.ndarray],
     ) -> tuple[np.ndarray, np.ndarray]:
 
+        outputs = self._correct_singlebatch_tensors(
+            reference_frames=torch.from_numpy(reference_frames),
+            target_frames=None if target_frames is None else torch.from_numpy(target_frames),
+        )
+        return outputs[0].cpu().numpy(), outputs[1].cpu().numpy()
+
+    def _correct_singlebatch_tensors(
+            self,
+            reference_frames: torch.Tensor,
+            target_frames: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
         if self.template is None:
             raise ValueError(
                 "Template is uninitialized"
             )
 
+        non_blocking = self.device.startswith("cuda")
         if target_frames is not None:
-            target_frames = torch.from_numpy(target_frames).to(self.device).float()
+            target_frames = target_frames.to(self.device, dtype=torch.float32, non_blocking=non_blocking)
 
-        reference_frames = torch.from_numpy(reference_frames).to(self.device).float()
-        
-        template = torch.from_numpy(self.template).to(self.device).float()
+        reference_frames = reference_frames.to(self.device, dtype=torch.float32, non_blocking=non_blocking)
+        template = torch.as_tensor(self.template, device=self.device, dtype=torch.float32)
         if self.pixel_weighting is not None:
-            pixel_weighting = torch.from_numpy(self.pixel_weighting).to(self.device).float()
+            pixel_weighting = torch.as_tensor(self.pixel_weighting, device=self.device, dtype=torch.float32)
         else:
             pixel_weighting = None
 
-        outputs = register_frames_pwrigid(
-            reference_frames.to(self.device),
+        return register_frames_pwrigid(
+            reference_frames,
             template,
             self.num_blocks,
             self.overlaps,
@@ -423,8 +505,6 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             target_frames=target_frames,
             pixel_weighting=pixel_weighting
         )
-
-        return outputs[0].cpu().numpy(), outputs[1].cpu().numpy()
 
     def compute_template(
             self,
