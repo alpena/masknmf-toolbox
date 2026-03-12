@@ -23,9 +23,9 @@ class MotionCorrectionConfig:
     output_compression: str = "none"
     export_extract_optimized_h5: bool = False
     extract_orientation_fix: str = "transpose_xy"
-    extract_chunk_t: int = 256
-    extract_chunk_x: int = 256
-    extract_chunk_y: int = 256
+    extract_chunk_t: int = 1
+    extract_chunk_x: int = 0
+    extract_chunk_y: int = 0
     num_blocks_dim1: int = 20
     num_blocks_dim2: int = 20
     overlaps_dim1: int = 25
@@ -206,20 +206,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--extract_chunk_t",
         type=int,
-        default=256,
+        default=1,
         help="Chunk size in t for direct EXTRACT H5 export.",
     )
     parser.add_argument(
         "--extract_chunk_x",
         type=int,
-        default=256,
-        help="Chunk size in x (stored axis-2) for direct EXTRACT H5 export.",
+        default=0,
+        help="Chunk size in x (stored axis-2) for direct EXTRACT H5 export. Set <=0 for full axis.",
     )
     parser.add_argument(
         "--extract_chunk_y",
         type=int,
-        default=256,
-        help="Chunk size in y (stored axis-3) for direct EXTRACT H5 export.",
+        default=0,
+        help="Chunk size in y (stored axis-3) for direct EXTRACT H5 export. Set <=0 for full axis.",
     )
     parser.add_argument(
         "--num_blocks_dim1",
@@ -497,6 +497,17 @@ def export_standard_h5_streaming(
             chunks=(min(batch_size, num_frames), fov_h, fov_w),
             compression=compression_value,
         )
+        f_per_pixel_dset = h5f.create_dataset(
+            "F_per_pixel",
+            shape=(fov_h, fov_w),
+            dtype=np.float32,
+            compression=compression_value,
+        )
+        f_per_pixel_dset.attrs["producer"] = "masknmf_motion_correct_data"
+        f_per_pixel_dset.attrs["source_dataset"] = "/motion_corrected"
+        f_per_pixel_dset.attrs["frame_begin"] = np.int64(1)
+        f_per_pixel_dset.attrs["frame_end"] = np.int64(num_frames)
+        f_per_pixel_dset.attrs["orientation_fix"] = "none"
         if shifts_shape is not None:
             shifts_dset = h5f.create_dataset(
                 "shifts",
@@ -507,6 +518,7 @@ def export_standard_h5_streaming(
         else:
             shifts_dset = None
 
+        sum_image = np.zeros((fov_h, fov_w), dtype=np.float64)
         starts = list(range(0, num_frames, batch_size))
         for start in tqdm(starts, desc="Exporting H5 batches", unit="batch"):
             end = min(start + batch_size, num_frames)
@@ -520,8 +532,11 @@ def export_standard_h5_streaming(
                 to_store = moco_subset.astype(np.float32)
 
             motion_dset[start:end, :, :] = to_store
+            sum_image += np.asarray(to_store, dtype=np.float32).sum(axis=0, dtype=np.float64)
             if shifts_dset is not None:
                 shifts_dset[start:end, ...] = np.asarray(shifts_subset, dtype=np.float32)
+
+        f_per_pixel_dset[:, :] = (sum_image / float(num_frames)).astype(np.float32)
 
     return output_path
 
@@ -533,9 +548,9 @@ def export_extract_h5_streaming(
     motion_dtype: str = "uint16",
     compression: str = "lzf",
     orientation_fix: str = "transpose_xy",
-    chunk_t: int = 256,
-    chunk_x: int = 256,
-    chunk_y: int = 256,
+    chunk_t: int = 1,
+    chunk_x: int = 0,
+    chunk_y: int = 0,
 ) -> Path:
     output_path = Path(out_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -577,8 +592,8 @@ def export_extract_h5_streaming(
         matlab_view = (fov_h, fov_w, num_frames)
 
     chunk_t_eff = max(1, min(int(chunk_t), num_frames))
-    chunk_x_eff = max(1, min(int(chunk_x), out_shape[1]))
-    chunk_y_eff = max(1, min(int(chunk_y), out_shape[2]))
+    chunk_x_eff = out_shape[1] if int(chunk_x) <= 0 else max(1, min(int(chunk_x), out_shape[1]))
+    chunk_y_eff = out_shape[2] if int(chunk_y) <= 0 else max(1, min(int(chunk_y), out_shape[2]))
 
     bytes_per_voxel = np.dtype(motion_np_dtype).itemsize
     max_chunk_bytes = 4 * 1024**3 - 1
@@ -613,6 +628,18 @@ def export_extract_h5_streaming(
             chunks=(chunk_t_eff, chunk_x_eff, chunk_y_eff),
             compression=compression_value,
         )
+        f_per_pixel_shape = (out_shape[1], out_shape[2])
+        f_per_pixel_dset = h5f.create_dataset(
+            "F_per_pixel",
+            shape=f_per_pixel_shape,
+            dtype=np.float32,
+            compression=compression_value,
+        )
+        f_per_pixel_dset.attrs["producer"] = "masknmf_motion_correct_data"
+        f_per_pixel_dset.attrs["source_dataset"] = "/mov"
+        f_per_pixel_dset.attrs["frame_begin"] = np.int64(1)
+        f_per_pixel_dset.attrs["frame_end"] = np.int64(num_frames)
+        f_per_pixel_dset.attrs["orientation_fix"] = orientation_fix
         if shifts_shape is not None:
             shifts_dset = h5f.create_dataset(
                 "shifts",
@@ -623,6 +650,7 @@ def export_extract_h5_streaming(
         else:
             shifts_dset = None
 
+        sum_image = np.zeros(f_per_pixel_shape, dtype=np.float64)
         starts = list(range(0, num_frames, batch_size))
         for start in tqdm(starts, desc="Exporting EXTRACT H5 batches", unit="batch"):
             end = min(start + batch_size, num_frames)
@@ -635,12 +663,17 @@ def export_extract_h5_streaming(
                 to_store = moco_subset.astype(np.float32)
 
             if orientation_fix == "transpose_xy":
-                mov_dset[start:end, :, :] = to_store.transpose(0, 2, 1)
+                to_store_oriented = to_store.transpose(0, 2, 1)
             else:
-                mov_dset[start:end, :, :] = to_store
+                to_store_oriented = to_store
+
+            mov_dset[start:end, :, :] = to_store_oriented
+            sum_image += np.asarray(to_store_oriented, dtype=np.float32).sum(axis=0, dtype=np.float64)
 
             if shifts_dset is not None:
                 shifts_dset[start:end, ...] = np.asarray(shifts_subset, dtype=np.float32)
+
+        f_per_pixel_dset[:, :] = (sum_image / float(num_frames)).astype(np.float32)
 
     return output_path
 
