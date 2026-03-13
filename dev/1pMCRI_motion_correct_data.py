@@ -994,8 +994,8 @@ def export_extract_h5_streaming_async(
             worker_error.put(exc)
             stop_event.set()
 
-    reader_thread = threading.Thread(target=reader_worker, name="masknmf-reader", daemon=True)
-    writer_thread = threading.Thread(target=writer_worker, name="masknmf-writer", daemon=True)
+    reader_thread = threading.Thread(target=reader_worker, name="masknmf-reader")
+    writer_thread = threading.Thread(target=writer_worker, name="masknmf-writer")
     reader_thread.start()
     writer_thread.start()
 
@@ -1041,8 +1041,11 @@ def export_extract_h5_streaming_async(
                 if not writer_thread.is_alive():
                     break
                 continue
-        reader_thread.join(timeout=5)
-        writer_thread.join(timeout=5)
+        reader_thread.join()
+        writer_thread.join()
+
+    if reader_thread.is_alive() or writer_thread.is_alive():
+        raise RuntimeError("Async EXTRACT export threads did not terminate cleanly.")
 
     raise_worker_error()
     if not output_path.exists():
