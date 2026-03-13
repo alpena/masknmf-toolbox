@@ -24,7 +24,7 @@ class MotionCorrectionConfig:
     export_tiff_stack: bool = True
     output_dtype: str = "uint16"
     output_compression: str = "none"
-    export_extract_optimized_h5: bool = False
+    export_extract_optimized_h5: bool = True
     extract_orientation_fix: str = "transpose_xy"
     extract_chunk_t: int = 1
     extract_chunk_x: int = 0
@@ -190,7 +190,7 @@ def parse_args() -> argparse.Namespace:
         "--output_dtype",
         default="uint16",
         choices=["uint16", "float32"],
-        help="Data type of movie dataset in output HDF5 (/motion_corrected or /mov).",
+        help="Data type of movie dataset in output HDF5 (/mov in standard mode, /motion_corrected in legacy mode).",
     )
     parser.add_argument(
         "--output_compression",
@@ -201,8 +201,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--export_extract_optimized_h5",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Write EXTRACT-ready dataset '/mov' directly instead of '/motion_corrected'.",
+        default=True,
+        help="Write standard pipeline dataset '/mov'. Disable only for legacy '/motion_corrected' compatibility.",
     )
     parser.add_argument(
         "--extract_orientation_fix",
