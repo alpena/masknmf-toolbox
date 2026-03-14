@@ -24,9 +24,10 @@ class MotionCorrectionConfig:
     export_tiff_stack: bool = True
     output_dtype: str = "uint16"
     output_compression: str = "none"
+    persist_mov: bool = True
     export_extract_optimized_h5: bool = True
     extract_orientation_fix: str = "transpose_xy"
-    extract_chunk_t: int = 1
+    extract_chunk_t: int = 4
     extract_chunk_x: int = 0
     extract_chunk_y: int = 0
     num_blocks_dim1: int = 20
@@ -38,10 +39,13 @@ class MotionCorrectionConfig:
     max_deviation_rigid_dim1: int = 10
     max_deviation_rigid_dim2: int = 10
     frame_batch_size: int = 50
+    template_num_iterations: int = 1
+    template_num_splits_per_iteration: int = 6
+    template_num_frames_per_split: int = 150
     spatial_highpass_sigma: float = 3.0
     async_export: bool = True
-    prefetch_batches: int = 4
-    writer_queue_batches: int = 2
+    prefetch_batches: int = 8
+    writer_queue_batches: int = 4
     pin_memory: bool = True
     input_max_frames: int | None = None
     dcimg_first_4px_correction: bool = False
@@ -199,6 +203,12 @@ def parse_args() -> argparse.Namespace:
         help="Compression used when writing HDF5 datasets.",
     )
     parser.add_argument(
+        "--persist_mov",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to persist the dense motion-corrected /mov dataset in HDF5 output.",
+    )
+    parser.add_argument(
         "--export_extract_optimized_h5",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -213,7 +223,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--extract_chunk_t",
         type=int,
-        default=1,
+        default=4,
         help="Chunk size in t for direct EXTRACT H5 export.",
     )
     parser.add_argument(
@@ -283,6 +293,24 @@ def parse_args() -> argparse.Namespace:
         help="Frames processed per batch (trade-off: speed vs memory usage).",
     )
     parser.add_argument(
+        "--template_num_iterations",
+        type=int,
+        default=1,
+        help="Number of template-refinement passes during initialization.",
+    )
+    parser.add_argument(
+        "--template_num_splits_per_iteration",
+        type=int,
+        default=6,
+        help="Number of random frame chunks sampled per template-refinement pass.",
+    )
+    parser.add_argument(
+        "--template_num_frames_per_split",
+        type=int,
+        default=150,
+        help="Frames per sampled chunk during template initialization.",
+    )
+    parser.add_argument(
         "--spatial_highpass_sigma",
         type=float,
         default=3.0,
@@ -297,13 +325,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prefetch_batches",
         type=int,
-        default=4,
+        default=8,
         help="Number of raw batches to keep queued in CPU memory ahead of the GPU worker.",
     )
     parser.add_argument(
         "--writer_queue_batches",
         type=int,
-        default=2,
+        default=4,
         help="Maximum number of processed batches waiting for HDF5 writer flush.",
     )
     parser.add_argument(
@@ -345,6 +373,7 @@ def config_from_args(args: argparse.Namespace) -> MotionCorrectionConfig:
         export_tiff_stack=args.export_tiff_stack,
         output_dtype=args.output_dtype,
         output_compression=args.output_compression,
+        persist_mov=args.persist_mov,
         export_extract_optimized_h5=args.export_extract_optimized_h5,
         extract_orientation_fix=args.extract_orientation_fix,
         extract_chunk_t=args.extract_chunk_t,
@@ -380,6 +409,7 @@ def build_config_for_path(
         export_tiff_stack=args.export_tiff_stack,
         output_dtype=args.output_dtype,
         output_compression=args.output_compression,
+        persist_mov=args.persist_mov,
         export_extract_optimized_h5=args.export_extract_optimized_h5,
         extract_orientation_fix=args.extract_orientation_fix,
         extract_chunk_t=args.extract_chunk_t,
@@ -709,6 +739,7 @@ def export_extract_h5_streaming(
     chunk_t: int = 1,
     chunk_x: int = 0,
     chunk_y: int = 0,
+    persist_mov: bool = True,
 ) -> Path:
     output_path = Path(out_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -779,13 +810,15 @@ def export_extract_h5_streaming(
     )
 
     with h5py.File(str(output_path), "w") as h5f:
-        mov_dset = h5f.create_dataset(
-            "mov",
-            shape=out_shape,
-            dtype=motion_np_dtype,
-            chunks=(chunk_t_eff, chunk_x_eff, chunk_y_eff),
-            compression=compression_value,
-        )
+        mov_dset = None
+        if persist_mov:
+            mov_dset = h5f.create_dataset(
+                "mov",
+                shape=out_shape,
+                dtype=motion_np_dtype,
+                chunks=(chunk_t_eff, chunk_x_eff, chunk_y_eff),
+                compression=compression_value,
+            )
         f_per_pixel_shape = (out_shape[1], out_shape[2])
         f_per_pixel_dset = h5f.create_dataset(
             "F_per_pixel",
@@ -825,7 +858,8 @@ def export_extract_h5_streaming(
             else:
                 to_store_oriented = to_store
 
-            mov_dset[start:end, :, :] = to_store_oriented
+            if mov_dset is not None:
+                mov_dset[start:end, :, :] = to_store_oriented
             sum_image += np.asarray(to_store_oriented, dtype=np.float32).sum(axis=0, dtype=np.float64)
 
             if shifts_dset is not None:
@@ -851,6 +885,7 @@ def export_extract_h5_streaming_async(
     prefetch_batches: int = 4,
     writer_queue_batches: int = 2,
     pin_memory: bool = True,
+    persist_mov: bool = True,
 ) -> Path:
     output_path = Path(out_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -949,13 +984,15 @@ def export_extract_h5_streaming_async(
         sum_image = np.zeros((out_shape[1], out_shape[2]), dtype=np.float64)
         try:
             with h5py.File(str(output_path), "w") as h5f:
-                mov_dset = h5f.create_dataset(
-                    "mov",
-                    shape=out_shape,
-                    dtype=motion_np_dtype,
-                    chunks=chunk_shape,
-                    compression=compression_value,
-                )
+                mov_dset = None
+                if persist_mov:
+                    mov_dset = h5f.create_dataset(
+                        "mov",
+                        shape=out_shape,
+                        dtype=motion_np_dtype,
+                        chunks=chunk_shape,
+                        compression=compression_value,
+                    )
                 f_per_pixel_dset = h5f.create_dataset(
                     "F_per_pixel",
                     shape=(out_shape[1], out_shape[2]),
@@ -982,7 +1019,8 @@ def export_extract_h5_streaming_async(
                     if item is sentinel:
                         break
                     start, end, to_store_oriented, shifts_subset = item
-                    mov_dset[start:end, :, :] = to_store_oriented
+                    if mov_dset is not None:
+                        mov_dset[start:end, :, :] = to_store_oriented
                     sum_image += np.asarray(
                         to_store_oriented, dtype=np.float32
                     ).sum(axis=0, dtype=np.float64)
@@ -1099,10 +1137,20 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             batching=config.frame_batch_size,
             device=pwrigid_strategy.device,
         )
-        pwrigid_strategy.compute_template(filtered_reference)
+        pwrigid_strategy.compute_template(
+            filtered_reference,
+            num_iterations=config.template_num_iterations,
+            num_splits_per_iteration=config.template_num_splits_per_iteration,
+            num_frames_per_split=config.template_num_frames_per_split,
+        )
     else:
         print("Spatial high-pass disabled.")
-        pwrigid_strategy.compute_template(data_loader)
+        pwrigid_strategy.compute_template(
+            data_loader,
+            num_iterations=config.template_num_iterations,
+            num_splits_per_iteration=config.template_num_splits_per_iteration,
+            num_frames_per_split=config.template_num_frames_per_split,
+        )
 
     if (
         config.export_extract_optimized_h5
@@ -1124,7 +1172,20 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             prefetch_batches=config.prefetch_batches,
             writer_queue_batches=config.writer_queue_batches,
             pin_memory=config.pin_memory,
+            persist_mov=config.persist_mov,
         )
+        with h5py.File(str(out_path), "a") as h5f:
+            h5f.attrs["artifact_kind"] = "moco_direct" if config.persist_mov else "saved_shifts"
+            h5f.attrs["source_dcimg"] = str(Path(config.input_image_path).resolve())
+            h5f.attrs["num_frames"] = int(data_loader.shape[0])
+            h5f.attrs["raw_height"] = int(data_loader.shape[1])
+            h5f.attrs["raw_width"] = int(data_loader.shape[2])
+            h5f.attrs["num_blocks_dim1"] = int(config.num_blocks_dim1)
+            h5f.attrs["num_blocks_dim2"] = int(config.num_blocks_dim2)
+            h5f.attrs["overlaps_dim1"] = int(config.overlaps_dim1)
+            h5f.attrs["overlaps_dim2"] = int(config.overlaps_dim2)
+            h5f.attrs["output_dtype"] = str(config.output_dtype)
+            h5f.attrs["storage_order"] = "txy_h5py"
         print("Done.")
         return out_path
 
@@ -1154,6 +1215,7 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             chunk_t=config.extract_chunk_t,
             chunk_x=config.extract_chunk_x,
             chunk_y=config.extract_chunk_y,
+            persist_mov=config.persist_mov,
         )
     else:
         export_standard_h5_streaming(
@@ -1170,6 +1232,18 @@ def run_motion_correction(config: MotionCorrectionConfig) -> Path:
             batch_size=config.frame_batch_size,
             output_dtype=config.output_dtype,
         )
+    with h5py.File(str(out_path), "a") as h5f:
+        h5f.attrs["artifact_kind"] = "moco_direct" if config.persist_mov else "saved_shifts"
+        h5f.attrs["source_dcimg"] = str(Path(config.input_image_path).resolve())
+        h5f.attrs["num_frames"] = int(data_loader.shape[0])
+        h5f.attrs["raw_height"] = int(data_loader.shape[1])
+        h5f.attrs["raw_width"] = int(data_loader.shape[2])
+        h5f.attrs["num_blocks_dim1"] = int(config.num_blocks_dim1)
+        h5f.attrs["num_blocks_dim2"] = int(config.num_blocks_dim2)
+        h5f.attrs["overlaps_dim1"] = int(config.overlaps_dim1)
+        h5f.attrs["overlaps_dim2"] = int(config.overlaps_dim2)
+        h5f.attrs["output_dtype"] = str(config.output_dtype)
+        h5f.attrs["storage_order"] = "txy_h5py"
     print("Done.")
     return out_path
 

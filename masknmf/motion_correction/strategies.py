@@ -509,8 +509,8 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
     def compute_template(
             self,
             frames: masknmf.ArrayLike | masknmf.LazyFrameLoader,
-            num_splits_per_iteration: int = 10,
-            num_frames_per_split: int = 200,
+            num_splits_per_iteration: int = 6,
+            num_frames_per_split: int = 150,
             num_iterations: int = 1,
     ):
         rigid_strategy = RigidMotionCorrector(
@@ -523,6 +523,9 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
 
         rigid_strategy.compute_template(
             frames,
+            num_splits_per_iteration=num_splits_per_iteration,
+            num_frames_per_split=num_frames_per_split,
+            num_iterations=num_iterations,
         )
 
         self._template = rigid_strategy.template
