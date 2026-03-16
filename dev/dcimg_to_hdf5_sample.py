@@ -68,6 +68,30 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Whether to overwrite an existing output file.",
     )
+    parser.add_argument(
+        "--row_start",
+        type=int,
+        default=None,
+        help="Crop start row (height axis, inclusive). Default: 0.",
+    )
+    parser.add_argument(
+        "--row_end",
+        type=int,
+        default=None,
+        help="Crop end row (height axis, exclusive). Default: full height.",
+    )
+    parser.add_argument(
+        "--col_start",
+        type=int,
+        default=None,
+        help="Crop start column (width axis, inclusive). Default: 0.",
+    )
+    parser.add_argument(
+        "--col_end",
+        type=int,
+        default=None,
+        help="Crop end column (width axis, exclusive). Default: full width.",
+    )
     return parser.parse_args()
 
 
@@ -79,6 +103,10 @@ def convert_dcimg_to_hdf5(
     compression: str = "lzf",
     first_4px_correction: bool = False,
     overwrite: bool = False,
+    row_start: int | None = None,
+    row_end: int | None = None,
+    col_start: int | None = None,
+    col_end: int | None = None,
 ) -> Path:
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -101,6 +129,24 @@ def convert_dcimg_to_hdf5(
 
     num_frames_total, height, width = arr.shape
     num_frames = num_frames_total if max_frames is None else min(num_frames_total, max_frames)
+
+    rs = row_start if row_start is not None else 0
+    re = row_end   if row_end   is not None else height
+    cs = col_start if col_start is not None else 0
+    ce = col_end   if col_end   is not None else width
+
+    if not (0 <= rs < re <= height):
+        raise ValueError(
+            f"Invalid row crop [{rs}, {re}) for source height {height}."
+        )
+    if not (0 <= cs < ce <= width):
+        raise ValueError(
+            f"Invalid col crop [{cs}, {ce}) for source width {width}."
+        )
+
+    out_height = re - rs
+    out_width  = ce - cs
+
     compression_value = None if compression == "none" else compression
     start_time = time.perf_counter()
 
@@ -110,29 +156,35 @@ def convert_dcimg_to_hdf5(
         print(f"Exporting all {num_frames} frames")
     else:
         print(f"Exporting first {num_frames} frames")
+    if (rs, re, cs, ce) != (0, height, 0, width):
+        print(f"Spatial crop: rows [{rs}:{re}], cols [{cs}:{ce}] → ({out_height}, {out_width})")
     print(f"Output: {out_path}")
 
     mode = "w" if overwrite else "w-"
     with h5py.File(str(out_path), mode) as h5f:
         dset = h5f.create_dataset(
             "motion_corrected",
-            shape=(num_frames, height, width),
+            shape=(num_frames, out_height, out_width),
             dtype=np.float32,
-            chunks=(min(batch_size, num_frames), height, width),
+            chunks=(min(batch_size, num_frames), out_height, out_width),
             compression=compression_value,
         )
 
         for start in range(0, num_frames, batch_size):
             end = min(start + batch_size, num_frames)
-            dset[start:end, :, :] = np.asarray(arr[start:end], dtype=np.float32)
+            dset[start:end, :, :] = np.asarray(arr[start:end], dtype=np.float32)[:, rs:re, cs:ce]
             print(f"  wrote frames {start}:{end} / {num_frames}")
 
         dset.attrs["source_path"] = str(input_path)
         dset.attrs["source_format"] = "dcimg"
         dset.attrs["frames"] = int(num_frames)
         dset.attrs["frames_total_in_source"] = int(num_frames_total)
-        dset.attrs["height"] = int(height)
-        dset.attrs["width"] = int(width)
+        dset.attrs["height"] = int(out_height)
+        dset.attrs["width"] = int(out_width)
+        dset.attrs["source_height"] = int(height)
+        dset.attrs["source_width"] = int(width)
+        dset.attrs["crop_row"] = [int(rs), int(re)]
+        dset.attrs["crop_col"] = [int(cs), int(ce)]
         dset.attrs["dtype"] = str(np.float32)
         dset.attrs["processed_at_utc"] = datetime.now(timezone.utc).isoformat()
         dset.attrs["processing_seconds"] = float(time.perf_counter() - start_time)
@@ -150,6 +202,10 @@ def main() -> None:
         compression=args.compression,
         first_4px_correction=args.first_4px_correction,
         overwrite=args.overwrite,
+        row_start=args.row_start,
+        row_end=args.row_end,
+        col_start=args.col_start,
+        col_end=args.col_end,
     )
     print(f"Done: {output_path}")
 
