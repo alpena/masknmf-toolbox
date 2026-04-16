@@ -6,12 +6,33 @@ from typing import *
 from typing import Tuple
 
 
+ALLOWED_SUBPIXEL_PRECISIONS = (0.1, 0.01, 0.001)
+
+
+def normalize_subpixel_precisions(
+    subpixel_precisions: Optional[Sequence[float]] = None,
+) -> tuple[float, ...]:
+    if subpixel_precisions is None:
+        return ALLOWED_SUBPIXEL_PRECISIONS
+    normalized = tuple(float(x) for x in subpixel_precisions)
+    if len(normalized) == 0:
+        raise ValueError("subpixel_precisions must contain at least one precision")
+    invalid = [x for x in normalized if x not in ALLOWED_SUBPIXEL_PRECISIONS]
+    if invalid:
+        raise ValueError(
+            "subpixel_precisions can only contain "
+            f"{ALLOWED_SUBPIXEL_PRECISIONS}. Input was {normalized}"
+        )
+    return normalized
+
+
 def register_frames_rigid(
     reference_frames: torch.tensor,
     template: torch.tensor,
     max_shifts: Tuple[int, int],
     target_frames: Optional[torch.tensor] = None,
     pixel_weighting: Optional[torch.tensor] = None,
+    subpixel_precisions: Optional[Sequence[float]] = None,
 ) -> Tuple[torch.tensor, torch.tensor]:
     """
     Runs full rigid motion correction pipeline: estimating shifts, applying shifts to the iamge stack, and using a copying scheme
@@ -34,7 +55,11 @@ def register_frames_rigid(
 
     # Compute shifts to align reference frame to template(s)
     rigid_shifts = estimate_rigid_shifts(
-        reference_frames, template, max_shifts, pixel_weighting=pixel_weighting
+        reference_frames,
+        template,
+        max_shifts,
+        pixel_weighting=pixel_weighting,
+        subpixel_precisions=subpixel_precisions,
     )
 
     # Apply these shifts to target frame
@@ -110,6 +135,7 @@ def estimate_rigid_shifts(
     template: torch.tensor,
     max_shifts: Tuple[int, int],
     pixel_weighting: Optional[torch.tensor] = None,
+    subpixel_precisions: Optional[Sequence[float]] = None,
 ) -> torch.tensor:
     """
     Estimate rigid shifts to apply to a given image stack to best align each frame to template(s)
@@ -196,7 +222,7 @@ def estimate_rigid_shifts(
     shifts_dim1, shifts_dim2 = torch.unravel_index(max_indices, (d1, d2))
     shifts = torch.stack([shifts_dim1, shifts_dim2], dim=1)
 
-    for precision in [0.1, 0.01, 0.001]:
+    for precision in normalize_subpixel_precisions(subpixel_precisions):
         shifts = subpixel_shift_method(shifts, fft_l2_objective, precision)
 
     shifts_dim1, shifts_dim2 = shifts[:, 0], shifts[:, 1]
@@ -239,9 +265,9 @@ def subpixel_shift_method(
     Returns:
         subpixel_estimates (torch.tensor): Shape (num_frames, 2). The optimal subpixel shifts
     """
-    if precision not in [0.1, 0.01, 0.001]:
+    if precision not in ALLOWED_SUBPIXEL_PRECISIONS:
         raise ValueError(
-            f"Precision can only be 0.1, 0.01, 0.001. Input was {precision}"
+            f"Precision can only be {ALLOWED_SUBPIXEL_PRECISIONS}. Input was {precision}"
         )
 
     num_frames, d1, d2 = fft_l2_objective.shape
@@ -626,6 +652,7 @@ def _estimate_patchwise_rigid_shifts(
     max_deviation_rigid: Tuple[int, int],
     rigid_shifts: torch.tensor,
     pixel_weighting: Optional[torch.tensor] = None,
+    subpixel_precisions: Optional[Sequence[float]] = None,
 ) -> torch.tensor:
     """
     Estimate rigid shifts to apply to a given image stack to best align each frame to template(s)
@@ -725,7 +752,7 @@ def _estimate_patchwise_rigid_shifts(
         (num_frames * num_patches, patch_dim1, patch_dim2)
     )
 
-    for precision in [0.1, 0.01, 0.001]:
+    for precision in normalize_subpixel_precisions(subpixel_precisions):
         shifts = subpixel_shift_method(shifts, fft_corr_reshape, precision)
 
     shifts_dim1, shifts_dim2 = shifts[:, 0], shifts[:, 1]
@@ -832,6 +859,7 @@ def register_frames_pwrigid(
     max_deviation_rigid: Tuple[int, int],
     target_frames: Optional[torch.tensor] = None,
     pixel_weighting: Optional[torch.tensor] = None,
+    subpixel_precisions: Optional[Sequence[float]] = None,
 ):
     """
     Performs piecewise rigid normcorre registration. Method estimates a motion vector field that quantifies motion of
@@ -881,7 +909,11 @@ def register_frames_pwrigid(
         )
 
     rigid_shifts = estimate_rigid_shifts(
-        reference_frames, template, max_rigid_shifts, pixel_weighting=pixel_weighting
+        reference_frames,
+        template,
+        max_rigid_shifts,
+        pixel_weighting=pixel_weighting,
+        subpixel_precisions=subpixel_precisions,
     )
 
     strides, dim1_start_pts, dim2_start_pts = compute_stride_routine(reference_frames.shape, num_blocks, overlaps)
@@ -923,6 +955,7 @@ def register_frames_pwrigid(
         pixel_weighting=patched_weights.reshape(
             patched_weights.shape[0], -1, patches[0], patches[1]
         ) if patched_weights is not None else None,
+        subpixel_precisions=subpixel_precisions,
     )
 
     patched_target_data = apply_rigid_shifts(patched_target_data.reshape(-1, patches[0], patches[1]),

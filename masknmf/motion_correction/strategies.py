@@ -10,7 +10,11 @@ from tqdm import tqdm
 
 import masknmf
 from masknmf.utils import torch_select_device
-from .registration_methods import register_frames_rigid, register_frames_pwrigid
+from .registration_methods import (
+    normalize_subpixel_precisions,
+    register_frames_rigid,
+    register_frames_pwrigid,
+)
 from masknmf.utils import Serializer
 
 
@@ -299,7 +303,8 @@ class RigidMotionCorrector(MotionCorrectionStrategy, Serializer):
         "max_shifts",
         "template",
         "pixel_weighting",
-        "batch_size"
+        "batch_size",
+        "subpixel_precisions",
     }
     
     def __init__(
@@ -309,11 +314,13 @@ class RigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             pixel_weighting: Optional[np.ndarray] = None,
             batch_size: int = 200,
             device: str = "auto",
+            subpixel_precisions: Optional[tuple[float, ...]] = None,
     ):
         super().__init__(template, batch_size=batch_size, device=device)
 
         self._max_shifts = max_shifts
         self._pixel_weighting = pixel_weighting
+        self._subpixel_precisions = normalize_subpixel_precisions(subpixel_precisions)
 
     @property
     def max_shifts(self) -> tuple[int, int]:
@@ -333,6 +340,10 @@ class RigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             return self._pixel_weighting
         else:
             return None
+
+    @property
+    def subpixel_precisions(self) -> tuple[float, ...]:
+        return self._subpixel_precisions
 
     def _correct_singlebatch(
             self,
@@ -372,7 +383,8 @@ class RigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             template,
             self.max_shifts,
             target_frames=target_frames,
-            pixel_weighting=pixel_weighting
+            pixel_weighting=pixel_weighting,
+            subpixel_precisions=self.subpixel_precisions,
         )
 
 
@@ -385,7 +397,8 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
         "max_deviation_rigid",
         "template",
         "pixel_weighting",
-        "batch_size"
+        "batch_size",
+        "subpixel_precisions",
     }
     
     def __init__(
@@ -398,6 +411,7 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             pixel_weighting: Optional[np.ndarray] = None,
             batch_size: int = 200,
             device: str = "auto",
+            subpixel_precisions: Optional[tuple[float, ...]] = None,
     ):
         super().__init__(template, batch_size=batch_size, device=device)
         self._num_blocks = num_blocks
@@ -405,6 +419,7 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
         self._max_rigid_shifts = max_rigid_shifts
         self._max_deviation_rigid = max_deviation_rigid
         self._pixel_weighting = torch.from_numpy(pixel_weighting).float() if pixel_weighting is not None else None
+        self._subpixel_precisions = normalize_subpixel_precisions(subpixel_precisions)
 
     @property
     def num_blocks(self) -> tuple[int, int]:
@@ -424,6 +439,10 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
     @property
     def pixel_weighting(self) -> None | np.ndarray:
         return self._pixel_weighting
+
+    @property
+    def subpixel_precisions(self) -> tuple[float, ...]:
+        return self._subpixel_precisions
 
     @property
     def overlaps(self) -> tuple[int, int]:
@@ -503,7 +522,8 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             self.max_rigid_shifts,
             self.max_deviation_rigid,
             target_frames=target_frames,
-            pixel_weighting=pixel_weighting
+            pixel_weighting=pixel_weighting,
+            subpixel_precisions=self.subpixel_precisions,
         )
 
     def compute_template(
@@ -519,6 +539,7 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             pixel_weighting=self.pixel_weighting,
             batch_size=self.batch_size,
             device=self.device,
+            subpixel_precisions=self.subpixel_precisions,
         )
 
         rigid_strategy.compute_template(
