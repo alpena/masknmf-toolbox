@@ -12,6 +12,7 @@ import masknmf
 from masknmf.utils import torch_select_device
 from .registration_methods import (
     normalize_subpixel_precisions,
+    normalize_pwrigid_warp_method,
     register_frames_rigid,
     register_frames_pwrigid,
 )
@@ -399,6 +400,7 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
         "pixel_weighting",
         "batch_size",
         "subpixel_precisions",
+        "warp_method",
     }
     
     def __init__(
@@ -412,6 +414,7 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             batch_size: int = 200,
             device: str = "auto",
             subpixel_precisions: Optional[tuple[float, ...]] = None,
+            warp_method: str = "patch_scatter",
     ):
         super().__init__(template, batch_size=batch_size, device=device)
         self._num_blocks = num_blocks
@@ -420,6 +423,7 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
         self._max_deviation_rigid = max_deviation_rigid
         self._pixel_weighting = torch.from_numpy(pixel_weighting).float() if pixel_weighting is not None else None
         self._subpixel_precisions = normalize_subpixel_precisions(subpixel_precisions)
+        self._warp_method = normalize_pwrigid_warp_method(warp_method)
 
     @property
     def num_blocks(self) -> tuple[int, int]:
@@ -443,6 +447,14 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
     @property
     def subpixel_precisions(self) -> tuple[float, ...]:
         return self._subpixel_precisions
+
+    @property
+    def warp_method(self) -> str:
+        return self._warp_method
+
+    @warp_method.setter
+    def warp_method(self, value: str):
+        self._warp_method = normalize_pwrigid_warp_method(value)
 
     @property
     def overlaps(self) -> tuple[int, int]:
@@ -524,6 +536,7 @@ class PiecewiseRigidMotionCorrector(MotionCorrectionStrategy, Serializer):
             target_frames=target_frames,
             pixel_weighting=pixel_weighting,
             subpixel_precisions=self.subpixel_precisions,
+            warp_method=self.warp_method,
         )
 
     def compute_template(

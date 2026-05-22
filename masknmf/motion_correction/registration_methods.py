@@ -7,6 +7,7 @@ from typing import Tuple
 
 
 ALLOWED_SUBPIXEL_PRECISIONS = (0.1, 0.01, 0.001)
+ALLOWED_PWRIGID_WARP_METHODS = ("patch_scatter", "dense_grid_sample")
 
 
 def normalize_subpixel_precisions(
@@ -22,6 +23,16 @@ def normalize_subpixel_precisions(
         raise ValueError(
             "subpixel_precisions can only contain "
             f"{ALLOWED_SUBPIXEL_PRECISIONS}. Input was {normalized}"
+        )
+    return normalized
+
+
+def normalize_pwrigid_warp_method(warp_method: str = "patch_scatter") -> str:
+    normalized = str(warp_method).strip().lower()
+    if normalized not in ALLOWED_PWRIGID_WARP_METHODS:
+        raise ValueError(
+            "pw-rigid warp_method must be one of "
+            f"{ALLOWED_PWRIGID_WARP_METHODS}. Input was {warp_method!r}"
         )
     return normalized
 
@@ -588,6 +599,109 @@ def generate_motion_field_from_pwrigid_shifts(
     return pixelwise_motion_vector
 
 
+def apply_pwrigid_dense_grid_sample_52a5adb(
+    target_frames: torch.Tensor,
+    patchwise_shifts: torch.Tensor,
+    fov_dim1: int,
+    fov_dim2: int,
+) -> torch.Tensor:
+    """
+    Apply pw-rigid patch shifts using the dense grid_sample warp introduced in 52a5adb.
+
+    ``patchwise_shifts`` is in pixel units and dy/dx order with shape
+    ``(num_frames, patch_grid_dim1, patch_grid_dim2, 2)``.
+    """
+    device = target_frames.device
+    num_frames = int(target_frames.shape[0])
+    if int(patchwise_shifts.shape[0]) != num_frames:
+        raise ValueError("patchwise_shifts frame dimension must match target_frames")
+
+    shift_field_lr = patchwise_shifts.permute(0, 3, 1, 2)
+    shift_field_hr = torch.nn.functional.interpolate(
+        shift_field_lr,
+        size=(fov_dim1, fov_dim2),
+        mode="bilinear",
+        align_corners=True,
+    )
+    shift_field_hr = shift_field_hr.permute(0, 2, 3, 1)
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, fov_dim1, device=device),
+        torch.linspace(-1, 1, fov_dim2, device=device),
+        indexing="ij",
+    )
+    base_grid = torch.stack((xx, yy), dim=-1)
+
+    shift_field_hr_norm = torch.empty_like(shift_field_hr)
+    shift_field_hr_norm[..., 0] = shift_field_hr[..., 1] * 2 / (fov_dim2 - 1)
+    shift_field_hr_norm[..., 1] = shift_field_hr[..., 0] * 2 / (fov_dim1 - 1)
+    sampling_grid = base_grid[None, ...] - shift_field_hr_norm
+
+    registered_frames = torch.nn.functional.grid_sample(
+        target_frames[:, None, :, :],
+        sampling_grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    ).squeeze(1)
+    return registered_frames
+
+
+def apply_pwrigid_patch_scatter_warp(
+    patched_target_data: torch.Tensor,
+    lowrank_patchwise_rigid_shifts: torch.Tensor,
+    interpolation_weighting: torch.Tensor,
+    dim1_start_pts: torch.Tensor,
+    dim2_start_pts: torch.Tensor,
+    fov_shape: tuple[int, int],
+) -> torch.Tensor:
+    num_frames = int(lowrank_patchwise_rigid_shifts.shape[0])
+    patch_grid_dim1 = int(lowrank_patchwise_rigid_shifts.shape[1])
+    patch_grid_dim2 = int(lowrank_patchwise_rigid_shifts.shape[2])
+    patches = (int(patched_target_data.shape[-2]), int(patched_target_data.shape[-1]))
+
+    patched_target_data = apply_rigid_shifts(
+        patched_target_data.reshape(-1, patches[0], patches[1]),
+        lowrank_patchwise_rigid_shifts.reshape(-1, 2),
+    )
+    patched_target_data = interpolate_to_border(
+        patched_target_data,
+        lowrank_patchwise_rigid_shifts.reshape(-1, 2),
+    )
+    patched_target_data *= interpolation_weighting[None, ...]
+    patched_target_data = patched_target_data.reshape(
+        num_frames,
+        patch_grid_dim1,
+        patch_grid_dim2,
+        patches[0],
+        patches[1],
+    )
+
+    interpolation_patches = torch.zeros(
+        1,
+        patch_grid_dim1,
+        patch_grid_dim2,
+        patches[0],
+        patches[1],
+        device=patched_target_data.device,
+    )
+    interpolation_patches += interpolation_weighting[None, None, None, :, :]
+
+    pwrigid_results = scatter_patches_to_fov(
+        patched_target_data,
+        dim1_start_pts,
+        dim2_start_pts,
+        fov_shape,
+    )
+    pwrigid_net_weightings = scatter_patches_to_fov(
+        interpolation_patches,
+        dim1_start_pts,
+        dim2_start_pts,
+        fov_shape,
+    )
+    return torch.nan_to_num(pwrigid_results / pwrigid_net_weightings, nan=0.0)
+
+
 def _valid_pixel_identifier(
     shift_lower_bounds: torch.Tensor,
     shift_upper_bounds: torch.Tensor,
@@ -860,6 +974,7 @@ def register_frames_pwrigid(
     target_frames: Optional[torch.tensor] = None,
     pixel_weighting: Optional[torch.tensor] = None,
     subpixel_precisions: Optional[Sequence[float]] = None,
+    warp_method: str = "patch_scatter",
 ):
     """
     Performs piecewise rigid normcorre registration. Method estimates a motion vector field that quantifies motion of
@@ -890,6 +1005,7 @@ def register_frames_pwrigid(
             version of the shift vector field.
 
     """
+    warp_method = normalize_pwrigid_warp_method(warp_method)
     device = reference_frames.device
     num_frames, fov_dim1, fov_dim2 = reference_frames.shape
 
@@ -958,28 +1074,28 @@ def register_frames_pwrigid(
         subpixel_precisions=subpixel_precisions,
     )
 
-    patched_target_data = apply_rigid_shifts(patched_target_data.reshape(-1, patches[0], patches[1]),
-                                       lowrank_patchwise_rigid_shifts.reshape(-1, 2))
-    patched_target_data = interpolate_to_border(patched_target_data,
-                                          lowrank_patchwise_rigid_shifts.reshape(-1, 2))
-
-    ## Multiply each patch by the interpolation matrix
-    patched_target_data *= interpolation_weighting[None,...]
-
-    ## Reshape everything to (num_frames, num_patches_dim0, num_patches_dim1, patch_height, patch_width)
-    patched_target_data = patched_target_data.reshape(num_frames, patch_grid_dim1, patch_grid_dim2, patches[0], patches[1])
-
-    interpolation_patches = torch.zeros(1, patch_grid_dim1, patch_grid_dim2, patches[0], patches[1], device=device)
-    interpolation_patches += interpolation_weighting[None, None, None, :, :]
-
-    ## Now efficiently scatter this data back to (num_frames, fov_dim1, fov_dim2) data
-    pwrigid_results = scatter_patches_to_fov(patched_target_data, dim1_start_pts, dim2_start_pts, (fov_dim1, fov_dim2))
-
-    pwrigid_net_weightings = scatter_patches_to_fov(interpolation_patches, dim1_start_pts, dim2_start_pts, (fov_dim1, fov_dim2))
-
-    return torch.nan_to_num(pwrigid_results / pwrigid_net_weightings, nan=0.0), lowrank_patchwise_rigid_shifts.reshape(
+    lowrank_patchwise_rigid_shifts = lowrank_patchwise_rigid_shifts.reshape(
         num_frames, patch_grid_dim1, patch_grid_dim2, 2
     )
+
+    if warp_method == "dense_grid_sample":
+        registered_frames = apply_pwrigid_dense_grid_sample_52a5adb(
+            target_frames.float(),
+            lowrank_patchwise_rigid_shifts,
+            fov_dim1,
+            fov_dim2,
+        )
+    else:
+        registered_frames = apply_pwrigid_patch_scatter_warp(
+            patched_target_data,
+            lowrank_patchwise_rigid_shifts,
+            interpolation_weighting,
+            dim1_start_pts,
+            dim2_start_pts,
+            (fov_dim1, fov_dim2),
+        )
+
+    return registered_frames, lowrank_patchwise_rigid_shifts
 
 
 def compute_pwrigid_patch_midpoints(num_blocks, overlaps, fov_height, fov_width):
